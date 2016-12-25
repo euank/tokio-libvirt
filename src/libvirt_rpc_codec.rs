@@ -93,17 +93,23 @@ fn parse_header(reader: &mut XdrReader) -> Result<Header, Error> {
     })
 }
 
+// https://github.com/libvirt/libvirt/blob/866641d4c5706413393913fdb3bb1cd077683d21/src/remote/remote_protocol.x#L3358-L3360
+const LIBVIRT_PROGRAM: u32 = 0x20008086;
+const LIBVIRT_PROTO_VERSION: u32 = 1;
+
 // Call params depend totally on the header's program+version
 fn parse_call_body(reader: &mut XdrReader, header: &Header) -> Result<Payload, Error> {
     let mut params: Vec<XdrType> = Vec::new();
-    // This is the dummy test data, TODO figure out what the right way to do this decoding is
-    // This probably makes more sense as a protocol than a codec, so it'll probably end up up the
-    // stack a bit.
-    if header.program == 8 && header.version == 1 {
-        params.push(XdrType::U32(reader.unpack::<u32>()?));
-        params.push(XdrType::U32(reader.unpack::<u32>()?));
-        params.push(XdrType::U32(reader.unpack::<u32>()?));
+
+    if header.program != LIBVIRT_PROGRAM || header.version != LIBVIRT_PROTO_VERSION {
+        Err(Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid program; not recognized as libvirt")))?
     }
+
+    if header.procedure == 4 {
+        // Get version
+        params.push(XdrType::U64(reader.unpack::<u64>()?));
+    }
+
     Ok(Payload::Call(Call { params: params }))
 }
 
@@ -188,25 +194,17 @@ mod tests {
     }
 
     #[test]
-    fn decode_call() {
-        // This example from the docs:
-        // https://libvirt.org/internals/rpc.html#wireexamplescall
-        // But modified to be valid.
-        // Unless I'm missing something, an xdr length has to be a multiple of 4 so the example
-        // with a length of 38 is impossible. I have no clue.
-        // I guess I'll come back to this comment in a few weeks and laugh
+    fn decode_version_call() {
         let mut wr = XdrWriter::new();
-        wr.pack(40 as u32); // len
-        wr.pack(8 as u32); // program
-        wr.pack(1 as u32); // version
-        wr.pack(3 as i32); // procedure
+        wr.pack(36 as u32); // len
+        wr.pack(super::LIBVIRT_PROGRAM); // program
+        wr.pack(super::LIBVIRT_PROTO_VERSION); // version
+        wr.pack(4 as i32); // procedure 'version'
         wr.pack(0 as i32); // type
         wr.pack(1 as u32); // serial
         wr.pack(0 as i32); // status
-        // 12 bytes of input, let's say it's 3x u32
-        wr.pack(1 as u32);
-        wr.pack(2 as u32);
-        wr.pack(3 as u32);
+        // return value
+        wr.pack(1 as u64);
         let buf = wr.into_buffer();
 
         let mut codec = super::LibvirtCodec;
@@ -214,19 +212,17 @@ mod tests {
 
         let packet = codec.decode(&mut buf).unwrap().unwrap();
         let expected_packet = super::Packet {
-            len: 40,
+            len: 36,
             header: super::Header {
-                program: 8,
-                version: 1,
-                procedure: 3,
+                program: super::LIBVIRT_PROGRAM,
+                version: super::LIBVIRT_PROTO_VERSION,
+                procedure: 4,
                 type_: 0,
                 serial: 1,
                 status: 0,
             },
             body: super::Payload::Call(super::Call {
-                params: vec![super::XdrType::U32(1),
-                             super::XdrType::U32(2),
-                             super::XdrType::U32(3)],
+                params: vec![super::XdrType::U64(1)],
             }),
         };
         assert_eq!(expected_packet, packet);

@@ -10,3 +10,4 @@ futures = "*"
 tokio-core = "*"
 tokio-proto = { git = "https://github.com/tokio-rs/tokio-proto" }
 xdr = { git = "https://github.com/euank/xdr-rs/", branch = "update-for-current-rs" }
+tokio-uds = "*"

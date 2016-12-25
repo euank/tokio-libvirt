@@ -1,5 +1,5 @@
 [package]
-name = "tokio-proto-libvirt"
+name = "tokio-libvirt"
 version = "0.1.0"
 authors = ["Euan Kemp <euank@euank.com>"]
 

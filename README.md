@@ -1,6 +1,6 @@
-# Tokio proto: Libvirt
+# Tokio Libvirt
 
-This is an implementation of the [libvirt rpc protocol](https://libvirt.org/internals/rpc.html#protocol) for [tokio-proto](https://github.com/tokio-rs/tokio-proto).
+This is an implementation of the [libvirt rpc protocol](https://libvirt.org/internals/rpc.html#protocol) for [tokio](https://github.com/tokio-rs/tokio).
 
 ## Status
 

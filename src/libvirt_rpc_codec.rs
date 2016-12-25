@@ -102,6 +102,18 @@ impl Codec for LibvirtCodec {
 mod tests {
     use tokio_core::io::Codec;
     use tokio_core::io::EasyBuf;
+    use std;
+    #[test]
+    fn it_retries_under_4_bytes() {
+        // Any packet under 4 bytes cannot be read because we need at least the length bit
+        let mut codec = super::LibvirtCodec;
+        for i in 1..3 {
+            let bytes = std::iter::repeat(10).take(i).collect::<Vec<_>>();
+            let mut buf = EasyBuf::from(bytes);
+            let packet = codec.decode(&mut buf).unwrap();
+            assert!(packet.is_none());
+        }
+    }
     #[test]
     fn decode_length() {
         // The trivial packet is a 4 byte packet that says its length is 4

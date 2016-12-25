@@ -1,18 +1,20 @@
 use tokio_core::io;
 use tokio_core::io::Codec;
+use xdr::xdr;
 use xdr::xdr::XdrReader;
 use std;
 
 pub struct LibvirtCodec;
 
 // https://libvirt.org/internals/rpc.html#protocol
+#[derive(PartialEq, Debug)]
 pub struct Packet {
     len: u32,
     header: Header,
     body: Payload,
 }
 
-
+#[derive(PartialEq, Debug)]
 struct Header {
     program: u32,
     version: u32,
@@ -22,6 +24,7 @@ struct Header {
     status: i32,
 }
 
+#[derive(PartialEq, Debug)]
 enum Payload {
     Call(Call),
 }
@@ -31,6 +34,7 @@ enum Payload {
 // If there's a nicer solution to this (I guess I could do Vec<Box<XdrType>>?; feels icky) then let
 // me know!
 // Listing everything out isn't too icky though, so *shrug
+#[derive(PartialEq, Debug)]
 enum XdrType {
     Vec(Vec<XdrType>),
     Bool(bool),
@@ -47,8 +51,60 @@ enum XdrType {
     String(String),
 }
 
+#[derive(PartialEq, Debug)]
 struct Call {
     params: Vec<XdrType>,
+}
+
+enum Error {
+    Io(std::io::Error),
+}
+
+impl From<xdr::Error> for Error {
+    fn from(err: xdr::Error) -> Self {
+        match err {
+            xdr::Error::Io(err) => Error::Io(err),
+            xdr::Error::InvalidValue => {
+                Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid xdr value"))
+            }
+            xdr::Error::InvalidType => {
+                Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid xdr type"))
+            }
+        }
+    }
+}
+
+impl From<Error> for std::io::Error {
+    fn from(err: Error) -> Self {
+        // There has to be a better way...
+        let Error::Io(e) = err;
+        e
+    }
+}
+
+fn parse_header(reader: &mut XdrReader) -> Result<Header, Error> {
+    Ok(Header {
+        program: reader.unpack::<u32>()?,
+        version: reader.unpack::<u32>()?,
+        procedure: reader.unpack::<i32>()?,
+        type_: reader.unpack::<i32>()?,
+        serial: reader.unpack::<u32>()?,
+        status: reader.unpack::<i32>()?,
+    })
+}
+
+// Call params depend totally on the header's program+version
+fn parse_call_body(reader: &mut XdrReader, header: &Header) -> Result<Payload, Error> {
+    let mut params: Vec<XdrType> = Vec::new();
+    // This is the dummy test data, TODO figure out what the right way to do this decoding is
+    // This probably makes more sense as a protocol than a codec, so it'll probably end up up the
+    // stack a bit.
+    if header.program == 8 && header.version == 1 {
+        params.push(XdrType::U32(reader.unpack::<u32>()?));
+        params.push(XdrType::U32(reader.unpack::<u32>()?));
+        params.push(XdrType::U32(reader.unpack::<u32>()?));
+    }
+    Ok(Payload::Call(Call { params: params }))
 }
 
 
@@ -62,33 +118,48 @@ impl Codec for LibvirtCodec {
             return Ok(None);
         }
 
-        let mutbuf = buf.get_mut();
-
-        let mut reader = XdrReader::new(&mutbuf);
-        let len = match reader.unpack::<u32>() {
-            Ok(x) => x,
-            Err(err) => {
-                Err(std::io::Error::new(std::io::ErrorKind::Other,
-                                               format!("error unpacking length: {}", err)))?
+        let len = {
+            // scope this mut borrow down so we can do it again when we drain
+            let len_data = Vec::from(&buf.as_slice()[0..4]);
+            let mut length_reader = XdrReader::new(&len_data);
+            match length_reader.unpack::<u32>() {
+                Ok(x) => x,
+                Err(err) => {
+                    Err(std::io::Error::new(std::io::ErrorKind::Other,
+                                            format!("error unpacking length: {}", err)))?
+                }
             }
         };
 
-        if len == 0 {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "wtf"));
+        // We need to wait on more data before we can decode this
+        if buf.len() < len as usize {
+            return Ok(None);
         }
 
-        let body = Payload::Call(Call { params: Vec::new() });
+
+        if len < 7 * 4 {
+            // length = 1 u32, header = 6 u32, 7 u32 total
+            // if the header is missing, this is a malformed packet. nothing we can do
+            Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                                    "too short buffer to be an rpc call; must have header + \
+                                     length"))?;
+        }
+
+        let mut remaining_bytes = buf.drain_to(len as usize);
+        // Skip the length since we already read it above
+        let mut remaining_bytes = remaining_bytes.split_off(4);
+        let bufmut = remaining_bytes.get_mut();
+
+        let mut reader = XdrReader::new(&bufmut);
+        let header = parse_header(&mut reader)?;
+        let body = match header.type_ {
+            0 => parse_call_body(&mut reader, &header)?,
+            _ => Err(std::io::Error::new(std::io::ErrorKind::Other, "TODO"))?,
+        };
 
         Ok(Some(Packet {
             len: len,
-            header: Header {
-                program: 0,
-                version: 0,
-                procedure: 0,
-                type_: 0,
-                serial: 0,
-                status: 0,
-            },
+            header: header,
             body: body,
         }))
     }
@@ -100,6 +171,7 @@ impl Codec for LibvirtCodec {
 
 #[cfg(test)]
 mod tests {
+    use xdr::xdr::XdrWriter;
     use tokio_core::io::Codec;
     use tokio_core::io::EasyBuf;
     use std;
@@ -114,13 +186,49 @@ mod tests {
             assert!(packet.is_none());
         }
     }
+
     #[test]
-    fn decode_length() {
-        // The trivial packet is a 4 byte packet that says its length is 4
+    fn decode_call() {
+        // This example from the docs:
+        // https://libvirt.org/internals/rpc.html#wireexamplescall
+        // But modified to be valid.
+        // Unless I'm missing something, an xdr length has to be a multiple of 4 so the example
+        // with a length of 38 is impossible. I have no clue.
+        // I guess I'll come back to this comment in a few weeks and laugh
+        let mut wr = XdrWriter::new();
+        wr.pack(40 as u32); // len
+        wr.pack(8 as u32); // program
+        wr.pack(1 as u32); // version
+        wr.pack(3 as i32); // procedure
+        wr.pack(0 as i32); // type
+        wr.pack(1 as u32); // serial
+        wr.pack(0 as i32); // status
+        // 12 bytes of input, let's say it's 3x u32
+        wr.pack(1 as u32);
+        wr.pack(2 as u32);
+        wr.pack(3 as u32);
+        let buf = wr.into_buffer();
+
         let mut codec = super::LibvirtCodec;
-        let buf = vec![0, 0, 0, 4];
         let mut buf = EasyBuf::from(buf);
+
         let packet = codec.decode(&mut buf).unwrap().unwrap();
-        assert_eq!(packet.len, 4);
+        let expected_packet = super::Packet {
+            len: 40,
+            header: super::Header {
+                program: 8,
+                version: 1,
+                procedure: 3,
+                type_: 0,
+                serial: 1,
+                status: 0,
+            },
+            body: super::Payload::Call(super::Call {
+                params: vec![super::XdrType::U32(1),
+                             super::XdrType::U32(2),
+                             super::XdrType::U32(3)],
+            }),
+        };
+        assert_eq!(expected_packet, packet);
     }
 }

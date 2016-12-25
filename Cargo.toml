@@ -1,0 +1,12 @@
+[package]
+name = "tokio-proto-libvirt"
+version = "0.1.0"
+authors = ["Euan Kemp <euank@euank.com>"]
+
+[dependencies]
+log = "*"
+env_logger = "*"
+futures = "*"
+tokio-core = "*"
+tokio-proto = { git = "https://github.com/tokio-rs/tokio-proto" }
+xdr = { git = "https://github.com/euank/xdr-rs/", branch = "update-for-current-rs" }
